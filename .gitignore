@@ -1,0 +1,24 @@
+.DS_Store
+*.swp
+*.swo
+*~
+*.tmp
+*.bak
+*.log
+
+# Local environment and secret material
+.env
+.env.*
+secrets/
+certs/
+ssl/
+*.key
+*.crt
+*.csr
+*.pem
+*.p12
+*.pfx
+
+# Optional local-only overrides
+*.local
+*.local.*
