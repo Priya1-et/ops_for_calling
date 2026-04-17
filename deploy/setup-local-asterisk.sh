@@ -1,69 +1,197 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =============================================================
+# Local Asterisk + coturn setup script
+#
+# Usage:
+#   sudo ./setup-local-asterisk.sh                  (local test, no IP replacement)
+#   sudo ./setup-local-asterisk.sh 203.0.113.50     (with public IP)
+#   sudo ./setup-local-asterisk.sh 203.0.113.50 192.168.1.100  (public + private IP)
+#
+# What this script does:
+#   1. Generates self-signed TLS cert (if not present)
+#   2. Copies all Asterisk + coturn configs
+#   3. Replaces ${PUBLIC_IP} / ${PRIVATE_IP} placeholders if IPs provided
+#   4. Restarts Asterisk + coturn
+#   5. Prints verification commands
+# =============================================================
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ASTERISK_DIR="${SCRIPT_DIR}/../asterisk"
+COTURN_DIR="${SCRIPT_DIR}/../coturn"
 LIVE_DIR="/etc/asterisk"
+TLS_DIR="/etc/asterisk/tls"
 
-echo "=== Local Asterisk setup for PJSIP WebRTC ==="
+PUBLIC_IP="${1:-}"
+PRIVATE_IP="${2:-}"
+
+echo "=== Local Asterisk + coturn setup ==="
+echo ""
+
+# --- Root check ---
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "ERROR: Run this script as root (sudo)."
   exit 1
 fi
 
+# --- Dependency check ---
+
 if ! command -v asterisk &>/dev/null; then
   echo "ERROR: asterisk binary not found. Install Asterisk first."
   exit 1
 fi
 
+# --- Self-signed TLS certificate ---
+
+if [ ! -f "${TLS_DIR}/asterisk.crt" ]; then
+  echo "--- Generating self-signed TLS certificate ---"
+  mkdir -p "${TLS_DIR}"
+
+  CERT_CN="${PUBLIC_IP:-localhost}"
+  openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -keyout "${TLS_DIR}/asterisk.key" \
+    -out "${TLS_DIR}/asterisk.crt" \
+    -subj "/CN=${CERT_CN}" \
+    2>/dev/null
+
+  chown asterisk:asterisk "${TLS_DIR}/asterisk.key" "${TLS_DIR}/asterisk.crt"
+  chmod 640 "${TLS_DIR}/asterisk.key"
+  chmod 644 "${TLS_DIR}/asterisk.crt"
+  echo "  Certificate created for CN=${CERT_CN}"
+else
+  echo "--- TLS certificate already exists at ${TLS_DIR}/asterisk.crt ---"
+fi
+
 echo ""
-echo "--- Copying config files to ${LIVE_DIR} ---"
-for f in pjsip.conf extensions.conf http.conf rtp.conf modules.conf; do
+
+# --- Copy Asterisk config files ---
+
+echo "--- Copying Asterisk configs to ${LIVE_DIR} ---"
+
+ASTERISK_FILES="pjsip.conf extensions.conf http.conf rtp.conf modules.conf cdr.conf cel.conf"
+
+for f in ${ASTERISK_FILES}; do
   if [ -f "${ASTERISK_DIR}/${f}" ]; then
     cp -v "${ASTERISK_DIR}/${f}" "${LIVE_DIR}/${f}"
   else
-    echo "SKIP: ${f} not found in ${ASTERISK_DIR}"
+    echo "  SKIP: ${f} not found in ${ASTERISK_DIR}"
   fi
 done
 
 echo ""
+
+# --- Copy coturn config ---
+
+if [ -f "${COTURN_DIR}/turnserver.conf" ]; then
+  echo "--- Copying coturn config to /etc/turnserver.conf ---"
+  cp -v "${COTURN_DIR}/turnserver.conf" /etc/turnserver.conf
+else
+  echo "--- SKIP: turnserver.conf not found in ${COTURN_DIR} ---"
+fi
+
+echo ""
+
+# --- Replace placeholders if IPs provided ---
+
+if [ -n "${PUBLIC_IP}" ]; then
+  echo "--- Replacing \${PUBLIC_IP} with ${PUBLIC_IP} ---"
+
+  sed -i "s/\${PUBLIC_IP}/${PUBLIC_IP}/g" \
+    "${LIVE_DIR}/pjsip.conf" \
+    "${LIVE_DIR}/rtp.conf" \
+    /etc/turnserver.conf 2>/dev/null || true
+
+  echo "  Done."
+fi
+
+if [ -n "${PRIVATE_IP}" ]; then
+  echo "--- Replacing \${PRIVATE_IP} with ${PRIVATE_IP} ---"
+
+  sed -i "s/\${PRIVATE_IP}/${PRIVATE_IP}/g" \
+    /etc/turnserver.conf 2>/dev/null || true
+
+  echo "  Done."
+fi
+
+echo ""
+
+# --- Create log directory for coturn ---
+
+mkdir -p /var/log/turnserver
+
+echo ""
+
+# --- Restart services ---
+
 echo "--- Restarting Asterisk ---"
 systemctl restart asterisk 2>/dev/null || asterisk -rx "core restart now"
 sleep 3
 
-echo ""
-echo "--- Verifying setup ---"
+if command -v turnserver &>/dev/null; then
+  echo "--- Restarting coturn ---"
+  systemctl restart coturn 2>/dev/null || true
+  sleep 1
+else
+  echo "--- coturn not installed, skipping ---"
+fi
 
 echo ""
-echo "[1] chan_sip status (should be empty / not loaded):"
+
+# --- Verification ---
+
+echo "=== Verification ==="
+
+echo ""
+echo "[1] chan_sip (should be empty / not loaded):"
 asterisk -rx "module show like chan_sip" 2>/dev/null || true
 
 echo ""
-echo "[2] PJSIP modules (should show multiple res_pjsip modules):"
-asterisk -rx "module show like pjsip" 2>/dev/null || true
-
-echo ""
-echo "[3] HTTP server status:"
-asterisk -rx "http show status" 2>/dev/null || true
-
-echo ""
-echo "[4] PJSIP transports (should show transport-ws):"
+echo "[2] PJSIP transports (should show: transport-ws, transport-wss, transport-udp):"
 asterisk -rx "pjsip show transports" 2>/dev/null || true
 
 echo ""
-echo "[5] PJSIP endpoints (should show kartik and 1001):"
+echo "[3] PJSIP endpoints (should show: venus, kartik, 1001, iagu-trunk):"
 asterisk -rx "pjsip show endpoints" 2>/dev/null || true
 
 echo ""
-echo "=== Done ==="
+echo "[4] HTTP server (should show TLS on port 8089):"
+asterisk -rx "http show status" 2>/dev/null || true
+
+echo ""
+echo "[5] Dialplan contexts:"
+asterisk -rx "dialplan show from-webrtc" 2>/dev/null | head -5 || true
+asterisk -rx "dialplan show from-iagu" 2>/dev/null | head -5 || true
+
+echo ""
+echo "=== Setup complete ==="
 echo ""
 echo "Next steps:"
 echo "  1. Start backend:   cd call_be && npm run start:dev"
 echo "  2. Start frontend:  cd call_fe && npm run dev"
-echo "  3. Open browser tab 1 -> register as 'kartik'"
-echo "  4. Open browser tab 2 -> register as '1001'"
+echo ""
+echo "Local testing (browser to browser):"
+echo "  3. Open tab 1 -> register as 'kartik'"
+echo "  4. Open tab 2 -> register as '1001'"
 echo "  5. From tab 1, dial '1001'"
 echo ""
-echo "If chan_sip is still loaded, check /etc/asterisk/modules.conf has: noload => chan_sip.so"
-echo "If no PJSIP transports show, check /etc/asterisk/pjsip.conf and http.conf"
+
+if [ -n "${PUBLIC_IP}" ]; then
+  echo "Production testing (browser to phone):"
+  echo "  6. Accept self-signed cert: visit https://${PUBLIC_IP}:8089 in browser"
+  echo "  7. Open app, register as 'venus'"
+  echo "  8. Dial an Australian number"
+  echo ""
+  echo "Port forwarding required on your router:"
+  echo "  5060/udp       -> this machine (SIP to/from Iagu)"
+  echo "  8089/tcp       -> this machine (WSS for browser)"
+  echo "  3478/udp+tcp   -> this machine (TURN)"
+  echo "  10000-20000/udp -> this machine (RTP audio)"
+  echo ""
+  echo "IMPORTANT: Send your IP (${PUBLIC_IP}) to Andrew/Iagu for trunk allowlisting."
+else
+  echo "To enable real phone calls later, re-run with your public IP:"
+  echo "  sudo $0 <PUBLIC_IP> [PRIVATE_IP]"
+fi
+echo ""
