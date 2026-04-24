@@ -25,8 +25,46 @@ TLS_DIR="/etc/asterisk/tls"
 
 PUBLIC_IP="${1:-}"
 PRIVATE_IP="${2:-}"
+DEFAULT_PRIVATE_IP="192.168.1.72"
+
+detect_private_ip() {
+  local route_ip
+  local host_ips
+  local detected=""
+
+  route_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+  if [ -n "${route_ip}" ] && [[ "${route_ip}" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
+    detected="${route_ip}"
+  fi
+
+  if [ -z "${detected}" ]; then
+    host_ips="$(hostname -I 2>/dev/null || true)"
+    detected="$(awk '{
+      for (i=1; i<=NF; i++) {
+        if ($i ~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/) {
+          print $i;
+          exit;
+        }
+      }
+    }' <<< "${host_ips}")"
+  fi
+
+  echo "${detected}"
+}
+
+if [ -z "${PRIVATE_IP}" ]; then
+  PRIVATE_IP="$(detect_private_ip)"
+fi
+
+if [ -z "${PRIVATE_IP}" ]; then
+  PRIVATE_IP="${DEFAULT_PRIVATE_IP}"
+  echo "--- Private IP auto-detect failed; using fallback ${DEFAULT_PRIVATE_IP} ---"
+fi
 
 echo "=== Local Asterisk + coturn setup ==="
+echo ""
+echo "Public IP:  ${PUBLIC_IP:-<not set>}"
+echo "Private IP: ${PRIVATE_IP:-<not detected>}"
 echo ""
 
 # --- Root check ---
@@ -106,14 +144,12 @@ if [ -n "${PUBLIC_IP}" ]; then
   echo "  Done."
 fi
 
-if [ -n "${PRIVATE_IP}" ]; then
-  echo "--- Replacing \${PRIVATE_IP} with ${PRIVATE_IP} ---"
+echo "--- Replacing \${PRIVATE_IP} with ${PRIVATE_IP} ---"
 
-  sed -i "s/\${PRIVATE_IP}/${PRIVATE_IP}/g" \
-    /etc/turnserver.conf 2>/dev/null || true
+sed -i "s/\${PRIVATE_IP}/${PRIVATE_IP}/g" /etc/turnserver.conf 2>/dev/null || true
+sed -i "s/^relay-ip=.*/relay-ip=${PRIVATE_IP}/" /etc/turnserver.conf 2>/dev/null || true
 
-  echo "  Done."
-fi
+echo "  Done."
 
 echo ""
 
